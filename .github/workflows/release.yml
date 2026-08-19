@@ -1,11 +1,94 @@
 name: Release
 
+# Builds the image and pushes it to Artifact Registry. It does NOT deploy.
+
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: us-central1
+  IMAGE: us-central1-docker.pkg.dev/software-mansion-dev/walnut/starknet-debugger-app
 
 jobs:
   release:
-    name: hello
+    name: build and push
     runs-on: ubuntu-latest
     steps:
-      - run: echo "hello"
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      # On a tag push github.ref_name is the tag (v1.2.3), but on a manual
+      # dispatch it is the branch name - and a branch name may contain "/",
+      # which is not a legal character in a Docker tag. Manual runs are tagged
+      # with the commit SHA instead, which is also how walnut-infra pins the
+      # image it deploys.
+      #
+      # "latest" is only moved by a real release. A dispatch from a branch must
+      # not repoint the tag that releases track.
+      - name: Work out the image tags
+        id: tags
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            primary="${IMAGE}:${GITHUB_REF_NAME}"
+            tags="${primary}"$'\n'"${IMAGE}:latest"
+          else
+            primary="${IMAGE}:${GITHUB_SHA}"
+            tags="${primary}"
+          fi
+          echo "primary=${primary}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # NEXT_PUBLIC_* are compiled into the browser bundle, so they belong here
+      # and not on the Cloud Run service. Changing one requires a rebuild.
+      # Every value is passed explicitly: several call sites use `??`, which
+      # treats an empty string as a real value instead of falling back.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'https://api.starkloupe.co' }}
+            NEXT_PUBLIC_LOG_LEVEL=${{ vars.NEXT_PUBLIC_LOG_LEVEL || 'warn' }}
+            NEXT_PUBLIC_USE_TRACKING=${{ vars.NEXT_PUBLIC_USE_TRACKING || 'false' }}
+
+      - name: How to deploy this image
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${{ steps.tags.outputs.primary }}"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
